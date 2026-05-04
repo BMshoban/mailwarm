@@ -710,3 +710,17 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
 });
+
+router.get('/dashboard', async (req, res) => {
+  const domains = await DomainWarmup.find();
+
+  res.json({
+    domains: domains.map(d => ({
+      domain: d.domain,
+      status: d.status,
+      bounce_rate: d.metrics?.bounce_rate || 0,
+      spam_rate: d.metrics?.complaint_rate || 0,
+      daily_limit: d.current_daily_limit
+    }))
+  });
+});
