@@ -1,0 +1,32 @@
+{
+  "name": "mailwarm-orchestrator",
+  "version": "1.0.0",
+  "description": "Email Domain Warmup Orchestrator with AWS SES, MongoDB, and CloudWatch",
+  "main": "app.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node app.js",
+    "dev": "nodemon app.js"
+  },
+  "keywords": [
+    "email",
+    "warmup",
+    "aws-ses",
+    "cloudwatch",
+    "mongodb",
+    "mailwarm"
+  ],
+  "author": "shoban",
+  "license": "ISC",
+  "dependencies": {
+    "aws-sdk": "^2.1560.0",
+    "axios": "^1.6.8",
+    "express": "^4.19.2",
+    "mongoose": "^8.3.4",
+    "newrelic": "^11.0.0",
+    "node-cron": "^3.0.3"
+  },
+  "devDependencies": {
+    "nodemon": "^3.1.0"
+  }
+}
