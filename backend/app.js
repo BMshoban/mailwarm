@@ -7,17 +7,17 @@
  * - Smart delays
  * - Improved gating logic
  */
-
+require('dotenv').config();
 const AWS = require('aws-sdk');
 const mongoose = require('mongoose');
 const cron = require('node-cron');
 const express = require('express');
 
-const ses = new AWS.SES({ region: 'us-east-1' });
-
+//const ses = new AWS.SES({ region: 'ap-south-1' });
+const ses = new AWS.SES({ region: process.env.AWS_REGION });
 // ================= DB =================
 
-mongoose.connect(process.env.MONGO_URI);
+mongoose.connect(process.env.MONGODB_URI);
 
 const SeedInbox = mongoose.model('SeedInbox', new mongoose.Schema({
   email: String,
@@ -203,3 +203,34 @@ app.get('/status/:domain', async (req, res) => {
 });
 
 app.listen(3000, () => console.log("Server running"));
+app.get('/health', (req, res) => {
+  res.status(200).json({
+    status: "ok",
+    service: "mailwarm-backend"
+  });
+});
+
+app.get('/send-test', async (req, res) => {
+  try {
+    const result = await ses.sendEmail({
+      Source: process.env.SES_FROM_EMAIL,
+      Destination: {
+        ToAddresses: ["your-test@gmail.com"]
+      },
+      Message: {
+        Subject: { Data: "Test Email from SES" },
+        Body: {
+          Text: {
+            Data: "Hello! SES is working."
+          }
+        }
+      }
+    }).promise();
+
+    res.json({ success: true, messageId: result.MessageId });
+
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: error.message });
+  }
+});
