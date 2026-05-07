@@ -1,154 +1,315 @@
-/**
- * Advanced Mailwarm System (Upgraded)
- * Features:
- * - Dynamic seed inbox network
- * - Human-like email generation
- * - Reply simulation
- * - Smart delays
- * - Improved gating logic
- */
 require('dotenv').config();
+
 const AWS = require('aws-sdk');
 const mongoose = require('mongoose');
 const cron = require('node-cron');
 const express = require('express');
+const crypto = require('crypto');
 
-//const ses = new AWS.SES({ region: 'ap-south-1' });
-const ses = new AWS.SES({ region: process.env.AWS_REGION });
+const app = express();
+
+app.use(express.json());
+
+// ================= AWS =================
+
+const ses = new AWS.SES({
+  region: process.env.AWS_REGION
+});
+
+const sesv2 = new AWS.SESV2({
+  region: process.env.AWS_REGION
+});
+
+const cloudwatch = new AWS.CloudWatch({
+  region: process.env.AWS_REGION
+});
+
 // ================= DB =================
 
-mongoose.connect(process.env.MONGODB_URI);
+mongoose.connect(process.env.MONGODB_URI)
+  .then(() => {
+    console.log("✅ MongoDB connected");
+  })
+  .catch(err => {
+    console.error(err);
+  });
 
-const SeedInbox = mongoose.model('SeedInbox', new mongoose.Schema({
+// ================= MODELS =================
+
+const Client = mongoose.model('Client', new mongoose.Schema({
+  name: String,
   email: String,
-  provider: String,
-  active: Boolean,
-  health_score: { type: Number, default: 100 }
+  api_key: String
 }));
 
-const Warmup = mongoose.model('Warmup', new mongoose.Schema({
+const Domain = mongoose.model('Domain', new mongoose.Schema({
+  client_id: String,
   domain: String,
+  config_set: String,
   daily_limit: Number,
   sent_today: Number,
   status: String,
-  metrics: {
-    bounce_rate: Number,
-    complaint_rate: Number,
-    reply_rate: Number,
-    open_rate: Number
-  }
+  metrics: Object
 }));
+
+const SeedInbox = mongoose.model('SeedInbox', new mongoose.Schema({
+  email: String,
+  active: Boolean
+}));
+
+// ================= HELPERS =================
+
+function generateApiKey() {
+  return crypto.randomBytes(16).toString('hex');
+}
+
+// ================= METRICS =================
+
+async function getSESMetrics(configSet) {
+
+  const end = new Date();
+
+  const start = new Date(
+    end.getTime() - 24 * 60 * 60 * 1000
+  );
+
+  const names = [
+    "Send",
+    "Delivery",
+    "Bounce",
+    "Complaint"
+  ];
+
+  const results = {};
+
+  for (const name of names) {
+
+    const data =
+      await cloudwatch.getMetricStatistics({
+
+        Namespace: "AWS/SES",
+
+        MetricName: name,
+
+        Dimensions: [
+          {
+            Name: "ConfigurationSet",
+            Value: configSet
+          }
+        ],
+
+        StartTime: start,
+        EndTime: end,
+
+        Period: 86400,
+
+        Statistics: ["Sum"]
+
+      }).promise();
+
+    results[name] =
+      data.Datapoints[0]?.Sum || 0;
+  }
+
+  const sent = results.Send || 1;
+
+  return {
+
+    bounce_rate:
+      (results.Bounce / sent) * 100,
+
+    complaint_rate:
+      (results.Complaint / sent) * 100,
+
+    delivery_rate:
+      (results.Delivery / sent) * 100
+
+  };
+}
 
 // ================= ENGINE =================
 
 class WarmupEngine {
 
-  async sendWarmup(domain) {
-    const warmup = await Warmup.findOne({ domain });
-    if (!warmup || warmup.status === 'paused') return;
+  async sendWarmup(domainObj) {
 
-    const seedEmails = await SeedInbox.find({ active: true });
-
-    if (!seedEmails.length) {
-      console.log("No seed inboxes");
+    if (domainObj.status === "paused") {
       return;
     }
 
-    for (let i = 0; i < 5; i++) {
-      const target = this.random(seedEmails);
+    if (
+      domainObj.sent_today >=
+      domainObj.daily_limit
+    ) {
+      return;
+    }
 
-      const email = this.generateEmail();
+    const seeds =
+      await SeedInbox.find({
+        active: true
+      });
+
+    if (!seeds.length) {
+
+      console.log("❌ No seed inboxes");
+
+      return;
+    }
+
+    const remaining =
+      domainObj.daily_limit -
+      domainObj.sent_today;
+
+    const batch =
+      Math.min(10, remaining);
+
+    for (let i = 0; i < batch; i++) {
+
+      const target =
+        seeds[
+          Math.floor(
+            Math.random() * seeds.length
+          )
+        ];
+
+      console.log(
+        `📨 Sending email to ${target.email}`
+      );
 
       await ses.sendEmail({
-        Source: `noreply@${domain}`,
-        Destination: { ToAddresses: [target.email] },
+
+        Source:
+          `"Warmup" <${process.env.SES_FROM_EMAIL}>`,
+
+        Destination: {
+          ToAddresses: [target.email]
+        },
+
         Message: {
-          Subject: { Data: email.subject },
-          Body: { Text: { Data: email.body } }
-        }
+
+          Subject: {
+            Data: this.randomSubject()
+          },
+
+          Body: {
+
+            Html: {
+              Data: `
+                <html>
+                  <body>
+                    <p>${this.randomBody()}</p>
+
+                    <a href="https://google.com">
+                      Click Here
+                    </a>
+                  </body>
+                </html>
+              `
+            }
+
+          }
+
+        },
+
+        ConfigurationSetName:
+          domainObj.config_set
+
       }).promise();
+
+      console.log("✅ Email delivered");
 
       await this.delay();
     }
 
-    warmup.sent_today += 5;
-    await warmup.save();
+    domainObj.sent_today += batch;
+
+    await domainObj.save();
   }
 
-  generateEmail() {
-    const subjects = [
-      "Quick question",
-      "Checking in",
-      "Follow up",
-      "Just a thought"
-    ];
+  async checkMetrics(domainObj) {
 
-    const bodies = [
-      "Hey, just checking if you saw this.",
-      "Let me know your thoughts.",
-      "Following up on this.",
-      "Quick ping!"
-    ];
+    const metrics =
+      await getSESMetrics(
+        domainObj.config_set
+      );
 
-    return {
-      subject: this.random(subjects),
-      body: this.random(bodies)
-    };
-  }
+    domainObj.metrics = metrics;
 
-  async simulateReply() {
-    const seeds = await SeedInbox.find({ active: true });
-
-    for (const inbox of seeds) {
-      if (Math.random() > 0.5) continue;
-
-      const reply = {
-        subject: "Re: Quick question",
-        body: "Thanks, got it. Will check."
-      };
-
-      await ses.sendEmail({
-        Source: inbox.email,
-        Destination: { ToAddresses: ["noreply@yourdomain.com"] },
-        Message: {
-          Subject: { Data: reply.subject },
-          Body: { Text: { Data: reply.body } }
-        }
-      }).promise();
-    }
-  }
-
-  async checkMetrics(domain) {
-    // Fake for now (replace with CloudWatch)
-    const metrics = {
-      bounce_rate: Math.random() * 2,
-      complaint_rate: Math.random() * 0.1,
-      reply_rate: Math.random() * 10,
-      open_rate: Math.random() * 50
-    };
-
-    const warmup = await Warmup.findOne({ domain });
-
-    warmup.metrics = metrics;
-
+    // 🚨 Pause domain
     if (
       metrics.bounce_rate > 2 ||
       metrics.complaint_rate > 0.1
     ) {
-      warmup.status = "paused";
-      console.log(`Paused ${domain}`);
+
+      domainObj.status = "paused";
+
+      console.log(
+        `🚨 Paused ${domainObj.domain}`
+      );
+
+      await domainObj.save();
+
+      return;
     }
 
-    await warmup.save();
+    // 🚀 Auto scale
+    if (
+      metrics.delivery_rate > 95 &&
+      metrics.bounce_rate < 1
+    ) {
+
+      domainObj.daily_limit += 20;
+
+      if (domainObj.daily_limit > 2000) {
+        domainObj.daily_limit = 2000;
+      }
+
+      console.log(
+        `🚀 Scaling ${domainObj.domain} → ${domainObj.daily_limit}`
+      );
+    }
+
+    await domainObj.save();
   }
 
-  random(arr) {
-    return arr[Math.floor(Math.random() * arr.length)];
+  randomSubject() {
+
+    const subjects = [
+      "Quick question",
+      "Checking in",
+      "Follow up"
+    ];
+
+    return subjects[
+      Math.floor(
+        Math.random() * subjects.length
+      )
+    ];
+  }
+
+  randomBody() {
+
+    const bodies = [
+      "Hey, just checking if you saw this.",
+      "Following up on this.",
+      "Let me know your thoughts."
+    ];
+
+    return bodies[
+      Math.floor(
+        Math.random() * bodies.length
+      )
+    ];
   }
 
   async delay() {
-    const ms = Math.floor(Math.random() * 5000) + 1000;
-    return new Promise(r => setTimeout(r, ms));
+
+    const ms =
+      Math.floor(Math.random() * 3000) + 1000;
+
+    return new Promise(resolve =>
+      setTimeout(resolve, ms)
+    );
   }
 }
 
@@ -156,81 +317,308 @@ const engine = new WarmupEngine();
 
 // ================= CRON =================
 
-// send emails every hour
-cron.schedule('0 * * * *', async () => {
-  const domains = await Warmup.find({ status: "active" });
+// send every minute
+
+cron.schedule('*/1 * * * *', async () => {
+
+  const domains =
+    await Domain.find({
+      status: "active"
+    });
+
   for (const d of domains) {
-    await engine.sendWarmup(d.domain);
+
+    console.log(
+      `🚀 Sending warmup for ${d.domain}`
+    );
+
+    await engine.sendWarmup(d);
+
+    console.log(
+      `✅ Warmup completed for ${d.domain}`
+    );
   }
+
 });
 
-// simulate replies
-cron.schedule('*/30 * * * *', async () => {
-  await engine.simulateReply();
-});
+// metrics check every 6 hours
 
-// check metrics
 cron.schedule('0 */6 * * *', async () => {
-  const domains = await Warmup.find();
+
+  const domains =
+    await Domain.find();
+
   for (const d of domains) {
-    await engine.checkMetrics(d.domain);
+
+    await engine.checkMetrics(d);
+
   }
+
+});
+
+// reset counters daily
+
+cron.schedule('0 0 * * *', async () => {
+
+  await Domain.updateMany(
+    {},
+    {
+      sent_today: 0
+    }
+  );
+
+  console.log("🔄 Daily counters reset");
+
 });
 
 // ================= API =================
 
-const app = express();
-app.use(express.json());
+// create client
 
-app.post('/start', async (req, res) => {
+app.post('/client/create', async (req, res) => {
+
+  const { name, email } = req.body;
+
+  const client =
+    await Client.create({
+
+      name,
+      email,
+
+      api_key:
+        generateApiKey()
+
+    });
+
+  res.json(client);
+
+});
+
+// add domain
+
+app.post('/domain/add', async (req, res) => {
+
+  try {
+
+    const {
+      client_id,
+      domain
+    } = req.body;
+
+    const configSet =
+      `mailwarm-${domain.replace(/\./g, '-')}`;
+
+    try {
+
+      await sesv2.createConfigurationSet({
+
+        ConfigurationSetName:
+          configSet
+
+      }).promise();
+
+    } catch (err) {
+
+      if (
+        err.code !==
+          'AlreadyExistsException' &&
+        err.code !==
+          'ConfigurationSetAlreadyExistsException'
+      ) {
+
+        throw err;
+      }
+
+      console.log(
+        "⚠️ Config set already exists"
+      );
+    }
+
+    await Domain.create({
+
+      client_id,
+      domain,
+
+      config_set:
+        configSet,
+
+      daily_limit: 20,
+
+      sent_today: 0,
+
+      status: "active",
+
+      metrics: {}
+
+    });
+
+    res.json({
+      success: true
+    });
+
+  } catch (err) {
+
+    console.error(err);
+
+    res.status(500).json({
+      error: err.message
+    });
+
+  }
+
+});
+
+// add seed inbox
+
+app.post('/seed/add', async (req, res) => {
+
+  const { email } = req.body;
+
+  await SeedInbox.create({
+
+    email,
+    active: true
+
+  });
+
+  res.json({
+    success: true
+  });
+
+});
+
+// dashboard
+
+app.get('/dashboard', async (req, res) => {
+
+  try {
+
+    const domains =
+      await Domain.find();
+
+    const output =
+      domains.map(d => ({
+
+        domain: d.domain,
+
+        status: d.status,
+
+        bounce_rate:
+          d.metrics?.bounce_rate || 0,
+
+        spam_rate:
+          d.metrics?.complaint_rate || 0,
+
+        delivery_rate:
+          d.metrics?.delivery_rate || 0,
+
+        daily_limit:
+          d.daily_limit,
+
+        sent_today:
+          d.sent_today
+
+      }));
+
+    res.json({
+      domains: output
+    });
+
+  } catch (err) {
+
+    console.error(err);
+
+    res.status(500).json({
+      error: err.message
+    });
+
+  }
+
+});
+
+// client domains
+
+app.get('/client/:id/domains', async (req, res) => {
+
+  const data =
+    await Domain.find({
+      client_id: req.params.id
+    });
+
+  res.json(data);
+
+});
+
+// resume domain
+
+app.post('/domain/resume', async (req, res) => {
+
   const { domain } = req.body;
 
-  const warmup = new Warmup({
-    domain,
-    daily_limit: 50,
-    sent_today: 0,
-    status: "active"
+  await Domain.updateOne(
+
+    { domain },
+
+    {
+      status: "active"
+    }
+
+  );
+
+  res.json({
+    success: true
   });
 
-  await warmup.save();
-
-  res.json({ success: true });
 });
 
-app.get('/status/:domain', async (req, res) => {
-  const data = await Warmup.findOne({ domain: req.params.domain });
-  res.json(data);
-});
+// health
 
-app.listen(3000, () => console.log("Server running"));
 app.get('/health', (req, res) => {
-  res.status(200).json({
-    status: "ok",
-    service: "mailwarm-backend"
+
+  res.json({
+    status: "ok"
   });
+
 });
 
-app.get('/send-test', async (req, res) => {
+app.post('/domain/pause', async (req, res) => {
+
   try {
-    const result = await ses.sendEmail({
-      Source: process.env.SES_FROM_EMAIL,
-      Destination: {
-        ToAddresses: ["your-test@gmail.com"]
-      },
-      Message: {
-        Subject: { Data: "Test Email from SES" },
-        Body: {
-          Text: {
-            Data: "Hello! SES is working."
-          }
-        }
+
+    const { domain } = req.body;
+
+    await Domain.updateOne(
+
+      { domain },
+
+      {
+        status: "paused"
       }
-    }).promise();
 
-    res.json({ success: true, messageId: result.MessageId });
+    );
 
-  } catch (error) {
-    console.error(error);
-    res.status(500).json({ error: error.message });
+    res.json({
+      success: true
+    });
+
+  } catch (err) {
+
+    console.error(err);
+
+    res.status(500).json({
+      error: err.message
+    });
+
   }
+
+});
+
+// ================= SERVER =================
+
+app.listen(3000, () => {
+
+  console.log(
+    "🚀 Multi-client Mailwarm running"
+  );
+
 });
