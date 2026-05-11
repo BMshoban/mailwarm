@@ -141,6 +141,7 @@ class WarmupEngine {
       domainObj.sent_today >=
       domainObj.daily_limit
     ) {
+      await this.checkMetrics(domainObj);
       return;
     }
 
@@ -224,6 +225,10 @@ class WarmupEngine {
     domainObj.sent_today += batch;
 
     await domainObj.save();
+
+    // update metrics immediately
+
+    await this.checkMetrics(domainObj);
   }
 
   async checkMetrics(domainObj) {
@@ -233,12 +238,53 @@ class WarmupEngine {
         domainObj.config_set
       );
 
-    domainObj.metrics = metrics;
+    // ================= HEALTH SCORE =================
 
-    // 🚨 Pause domain
+    let health = 100;
+
+    health -=
+      (metrics.bounce_rate || 0) * 20;
+
+    health -=
+      (metrics.complaint_rate || 0) * 40;
+
+    health +=
+      (metrics.delivery_rate || 0) * 0.1;
+
+    if (health > 100) {
+      health = 100;
+    }
+
+    if (health < 0) {
+      health = 0;
+    }
+
+    // ================= SAVE METRICS =================
+
+    domainObj.metrics = {
+
+      bounce_rate:
+        metrics.bounce_rate || 0,
+
+      complaint_rate:
+        metrics.complaint_rate || 0,
+
+      delivery_rate:
+        metrics.delivery_rate || 0,
+
+      health_score:
+        Math.round(health)
+
+    };
+
+    // ================= AUTO PAUSE =================
+
     if (
-      metrics.bounce_rate > 2 ||
-      metrics.complaint_rate > 0.1
+
+      (metrics.bounce_rate || 0) > 2 ||
+
+      (metrics.complaint_rate || 0) > 0.1
+
     ) {
 
       domainObj.status = "paused";
@@ -252,16 +298,22 @@ class WarmupEngine {
       return;
     }
 
-    // 🚀 Auto scale
+    // ================= AUTO SCALE =================
+
     if (
-      metrics.delivery_rate > 95 &&
-      metrics.bounce_rate < 1
+
+      (metrics.delivery_rate || 0) > 95 &&
+
+      (metrics.bounce_rate || 0) < 1
+
     ) {
 
       domainObj.daily_limit += 20;
 
       if (domainObj.daily_limit > 2000) {
+
         domainObj.daily_limit = 2000;
+
       }
 
       console.log(
@@ -405,6 +457,59 @@ app.post('/domain/add', async (req, res) => {
       domain
     } = req.body;
 
+    // verify domain
+
+    try {
+
+      const identity =
+        await sesv2.getEmailIdentity({
+
+          EmailIdentity: domain
+
+        }).promise();
+
+      if (
+        !identity.VerifiedForSendingStatus
+      ) {
+
+        return res.status(400).json({
+
+          error:
+            "Domain is not verified in SES"
+
+        });
+
+      }
+
+    } catch (err) {
+
+      return res.status(400).json({
+
+        error:
+          "Domain identity not found in SES"
+
+      });
+
+    }
+
+    // check duplicate
+
+    const existing =
+      await Domain.findOne({ domain });
+
+    if (existing) {
+
+      return res.status(400).json({
+
+        error:
+          "Domain already added"
+
+      });
+
+    }
+
+    // config set
+
     const configSet =
       `mailwarm-${domain.replace(/\./g, '-')}`;
 
@@ -434,9 +539,12 @@ app.post('/domain/add', async (req, res) => {
       );
     }
 
+    // save domain
+
     await Domain.create({
 
       client_id,
+
       domain,
 
       config_set:
@@ -448,9 +556,56 @@ app.post('/domain/add', async (req, res) => {
 
       status: "active",
 
-      metrics: {}
+      metrics: {
+
+        bounce_rate: 0,
+
+        complaint_rate: 0,
+
+        delivery_rate: 0,
+
+        health_score: 100
+
+      }
 
     });
+
+    res.json({
+
+      success: true,
+
+      message:
+        "Domain added successfully"
+
+    });
+
+  } catch (err) {
+
+    console.error(err);
+
+    res.status(500).json({
+
+      error: err.message
+
+    });
+
+  }
+
+});
+
+// delete domain
+
+app.post('/domain/delete', async (req, res) => {
+
+  try {
+
+    const { domain } = req.body;
+
+    await Domain.deleteOne({ domain });
+
+    console.log(
+      `🗑️ Deleted domain ${domain}`
+    );
 
     res.json({
       success: true
@@ -503,14 +658,7 @@ app.get('/dashboard', async (req, res) => {
 
         status: d.status,
 
-        bounce_rate:
-          d.metrics?.bounce_rate || 0,
-
-        spam_rate:
-          d.metrics?.complaint_rate || 0,
-
-        delivery_rate:
-          d.metrics?.delivery_rate || 0,
+        metrics: d.metrics || {},
 
         daily_limit:
           d.daily_limit,
@@ -549,7 +697,7 @@ app.get('/client/:id/domains', async (req, res) => {
 
 });
 
-// resume domain
+// resume
 
 app.post('/domain/resume', async (req, res) => {
 
@@ -571,15 +719,7 @@ app.post('/domain/resume', async (req, res) => {
 
 });
 
-// health
-
-app.get('/health', (req, res) => {
-
-  res.json({
-    status: "ok"
-  });
-
-});
+// pause
 
 app.post('/domain/pause', async (req, res) => {
 
@@ -610,6 +750,16 @@ app.post('/domain/pause', async (req, res) => {
     });
 
   }
+
+});
+
+// health
+
+app.get('/health', (req, res) => {
+
+  res.json({
+    status: "ok"
+  });
 
 });
 
