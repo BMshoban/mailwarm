@@ -93,7 +93,7 @@ async function getSESMetrics(configSet) {
 
         Dimensions: [
           {
-            Name: "ConfigurationSet",
+            Name: "ses:configuration-set",
             Value: configSet
           }
         ],
